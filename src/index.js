@@ -2,9 +2,8 @@ import * as $path from "node:path";
 import * as $toml from "@iarna/toml";
 import { createFilter } from "@rollup/pluginutils";
 import { glob, rm, read, readString, debug, getEnv, isObject, eachObject } from "./utils.js";
-import * as $wasmBindgen from "./wasm-bindgen.js";
+import * as $wasmPack from "./wasm-pack.js";
 import * as $cargo from "./cargo.js";
-import * as $wasmOpt from "./wasm-opt.js";
 import * as $typescript from "./typescript.js";
 
 
@@ -53,7 +52,7 @@ class State {
             extraArgs: {
                 cargo: [],
 
-                wasmBindgen: [],
+                wasmPack: [],
 
                 // TODO figure out better optimization options ?
                 wasmOpt: ["-O"],
@@ -66,46 +65,9 @@ class State {
             },
         };
 
-        this.deprecations = {
-            debug: (cx, value) => {
-                cx.warn("The `debug` option has been changed to `optimize.release`");
-                this.options.optimize.release = !value;
-            },
-
-            cargoArgs: (cx, value) => {
-                cx.warn("The `cargoArgs` option has been changed to `extraArgs.cargo`");
-                this.options.extraArgs.cargo = value;
-            },
-
-            wasmBindgenArgs: (cx, value) => {
-                cx.warn("The `wasmBindgenArgs` option has been changed to `extraArgs.wasmBindgen`");
-                this.options.extraArgs.wasmBindgen = value;
-            },
-
-            wasmOptArgs: (cx, value) => {
-                cx.warn("The `wasmOptArgs` option has been changed to `extraArgs.wasmOpt`");
-                this.options.extraArgs.wasmOpt = value;
-            },
-
-            serverPath: (cx, value) => {
-                cx.warn("The `serverPath` option is deprecated and no longer works");
-            },
-
-            importHook: (cx, value) => {
-                cx.warn("The `importHook` option is deprecated and no longer works");
-            },
-
-            experimental: {
-                directExports: (cx, value) => {
-                    cx.warn("The `experimental.directExports` option is deprecated and no longer works");
-                },
-            },
-        };
-
         this.cache = {
             nightly: {},
             targetDir: {},
-            wasmBindgen: {},
             build: {},
         };
     }
@@ -116,7 +78,6 @@ class State {
 
         this.cache.nightly = {};
         this.cache.targetDir = {};
-        this.cache.wasmBindgen = {};
         this.cache.build = {};
     }
 
@@ -235,24 +196,6 @@ class State {
     }
 
 
-    async getWasmBindgen(dir) {
-        let bin = getEnv("WASM_BINDGEN_BIN", null);
-
-        if (bin == null) {
-            bin = this.cache.wasmBindgen[dir];
-
-            if (bin == null) {
-                bin = this.cache.wasmBindgen[dir] = $wasmBindgen.download(dir, this.options.verbose);
-            }
-
-            return await bin;
-
-        } else {
-            return bin;
-        }
-    }
-
-
     async loadWasm(outDir) {
         const wasmPath = $path.join(outDir, "index_bg.wasm");
 
@@ -261,17 +204,6 @@ class State {
         }
 
         return await read(wasmPath);
-    }
-
-
-    async compileTypescript(name, outDir) {
-        if (this.options.experimental.typescriptDeclarationDir != null) {
-            await $typescript.write(
-                name,
-                this.options.experimental.typescriptDeclarationDir,
-                outDir,
-            );
-        }
     }
 
 
@@ -284,137 +216,6 @@ class State {
                 this.options.experimental.synchronous,
             );
         }
-    }
-
-
-    async wasmOpt(cx, outDir) {
-        if (this.release) {
-            const result = await $wasmOpt.run({
-                dir: outDir,
-                input: "index_bg.wasm",
-                output: "wasm_opt.wasm",
-                extraArgs: this.options.extraArgs.wasmOpt,
-                verbose: this.options.verbose,
-            });
-
-            if (result !== null) {
-                cx.warn("wasm-opt failed: " + result.message);
-            }
-        }
-    }
-
-
-    compileInlineWasm(build) {
-        const wasmString = JSON.stringify(build.wasm.toString("base64"));
-
-        const code = `
-            const base64codes = [62,0,0,0,63,52,53,54,55,56,57,58,59,60,61,0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,0,0,0,0,0,0,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51];
-
-            function getBase64Code(charCode) {
-                return base64codes[charCode - 43];
-            }
-
-            function base64Decode(str) {
-                let missingOctets = str.endsWith("==") ? 2 : str.endsWith("=") ? 1 : 0;
-                let n = str.length;
-                let result = new Uint8Array(3 * (n / 4));
-                let buffer;
-
-                for (let i = 0, j = 0; i < n; i += 4, j += 3) {
-                    buffer =
-                        getBase64Code(str.charCodeAt(i)) << 18 |
-                        getBase64Code(str.charCodeAt(i + 1)) << 12 |
-                        getBase64Code(str.charCodeAt(i + 2)) << 6 |
-                        getBase64Code(str.charCodeAt(i + 3));
-                    result[j] = buffer >> 16;
-                    result[j + 1] = (buffer >> 8) & 0xFF;
-                    result[j + 2] = buffer & 0xFF;
-                }
-
-                return result.subarray(0, result.length - missingOctets);
-            }
-
-            export default base64Decode(${wasmString});
-        `;
-
-        return {
-            code,
-            map: { mappings: '' },
-            moduleSideEffects: false,
-        };
-    }
-
-
-    compileJsInline(build, isCustom) {
-        let mainCode;
-        let sideEffects;
-
-        if (this.options.experimental.synchronous) {
-            if (isCustom) {
-                sideEffects = false;
-
-                mainCode = `export { module };
-
-                export function init(options) {
-                    exports.initSync({
-                        module: options.module,
-                        memory: options.memory,
-                    });
-                    return exports;
-                }`
-
-            } else {
-                sideEffects = true;
-
-                mainCode = `
-                    exports.initSync({ module });
-                    export * from ${build.importPath};
-                `;
-            }
-
-        } else {
-            if (isCustom) {
-                sideEffects = false;
-
-                mainCode = `export { module };
-
-                export async function init(options) {
-                    await exports.default({
-                        module_or_path: await options.module,
-                        memory: options.memory,
-                    });
-                    return exports;
-                }`;
-
-            } else {
-                sideEffects = true;
-
-                mainCode = `
-                    await exports.default({ module_or_path: module });
-                    export * from ${build.importPath};
-                `;
-            }
-        }
-
-
-        const wasmString = JSON.stringify(build.wasm.toString("base64"));
-
-        const code = `
-            import * as exports from ${build.importPath};
-
-            import module from "${INLINE_ID}";
-
-            ${mainCode}
-        `;
-
-        return {
-            code,
-            map: { mappings: '' },
-            moduleSideEffects: sideEffects,
-            meta: {
-                "rollup-plugin-rust": { root: false, realPath: build.realPath }
-            },
-        };
     }
 
 
@@ -468,7 +269,6 @@ class State {
                 sideEffects = true;
 
                 mainCode = `
-                    await exports.default({ module_or_path: module });
                     export * from ${build.importPath};
                 `;
             }
@@ -491,12 +291,7 @@ class State {
 
 
     compileJs(build, isCustom) {
-        if (this.options.inlineWasm) {
-            return this.compileJsInline(build, isCustom);
-
-        } else {
-            return this.compileJsNormal(build, isCustom);
-        }
+        return this.compileJsNormal(build, isCustom);
     }
 
 
@@ -533,80 +328,40 @@ class State {
     }
 
 
-    async buildCargo(dir) {
-        const nightly = await this.getNightly(dir);
-
-        await $cargo.run({
+    async buildWasm(cx, dir, name, outDir) {
+        // Run wasm-pack instead of wasm-bindgen
+        await $wasmPack.run({
             dir,
-            nightly,
-            verbose: this.options.verbose,
-            extraArgs: this.options.extraArgs.cargo,
-            release: this.release,
-            optimize: this.options.optimize.rustc,
-        });
-    }
-
-
-    async buildWasm(cx, dir, bin, name, wasmPath, outDir) {
-        await $wasmBindgen.run({
-            bin,
-            dir,
-            wasmPath,
             outDir,
-            typescript: this.options.experimental.typescriptDeclarationDir != null,
-            extraArgs: this.options.extraArgs.wasmBindgen,
+            release: this.release,
+            extraArgs: this.options.extraArgs.wasmPack || [],
             verbose: this.options.verbose,
         });
 
-        const [wasm] = await Promise.all([
-            this.wasmOpt(cx, outDir).then(() => {
-                return this.loadWasm(outDir);
-            }),
-
-            this.compileTypescript(name, outDir),
-        ]);
-
-        let fileId;
-
-        if (!this.options.inlineWasm) {
-            fileId = cx.emitFile({
-                type: "asset",
-                source: wasm,
-                name: name + ".wasm"
-            });
-
-            this.fileIds.add(fileId);
-        }
-
+        // wasm-pack outputs index_bg.wasm and index.js in outDir
         const realPath = $path.join(outDir, "index.js");
-
-        // This returns a fake file path, this ensures that the directory is the
-        // same as the Cargo.toml file, which is necessary in order to make npm
-        // package imports work correctly.
-        const importPath = `"${PREFIX}${name}/index.js"`;
-
-        return { name, outDir, importPath, realPath, wasm, fileId };
+        const importPath = `"${outDir}/index.js"`;
+        if (this.options.verbose) {
+            debug(`Using import path ${importPath}`);
+            debug(`Using real path ${realPath}`);
+            debug(`Using name ${name}`);
+            debug(`Using outDir ${outDir}`);
+        }
+        return { name, outDir, importPath, realPath };
     }
-
 
     async build(cx, dir, id) {
         try {
             if (this.options.verbose) {
                 debug(`Compiling ${id}`);
             }
-
-            const [bin, { name, wasmPath, outDir }] = await Promise.all([
-                this.getWasmBindgen(dir),
+            const [{ name, wasmPath, outDir }] = await Promise.all([
                 this.getInfo(dir, id),
-                this.buildCargo(dir),
             ]);
-
-            return await this.buildWasm(cx, dir, bin, name, wasmPath, outDir);
-
+            return await this.buildWasm(cx, dir, name, outDir);
         } catch (e) {
             if (this.options.verbose) {
                 throw e;
-
             } else {
                 const e = new Error("Rust compilation failed");
                 e.stack = null;
@@ -624,6 +379,8 @@ class State {
         if (promise == null) {
             const dir = $path.dirname(id);
 
+            console.log(cx, dir, id);
+
             promise = this.cache.build[id] = Promise.all([
                 this.build(cx, dir, id),
                 this.watchFiles(cx, dir),
@@ -632,100 +389,63 @@ class State {
 
         const [build] = await promise;
 
-        if (oldId.endsWith("?inline")) {
-            return this.compileInlineWasm(build);
+        const isCustom = oldId.endsWith("?custom");
 
-        } else {
-            const isCustom = oldId.endsWith("?custom");
+        const [result] = await Promise.all([
+            this.compileJs(build, isCustom),
+            this.compileTypescriptCustom(build.name, isCustom),
+        ]);
 
-            const [result] = await Promise.all([
-                this.compileJs(build, isCustom),
-                this.compileTypescriptCustom(build.name, isCustom),
-            ]);
-
-            return result;
-        }
+        return result;
     }
 }
 
 
 export default function rust(options = {}) {
-    // TODO should the filter affect the watching ?
-    // TODO should the filter affect the Rust compilation ?
     const filter = createFilter(options.include, options.exclude);
-
     const state = new State(options);
-
     return {
         name: "rust",
-
-        // Vite-specific hook
         configResolved(config) {
             state.vite = true;
-
             if (config.command !== "build") {
-                // We have to force inlineWasm during dev because Vite doesn't support emitFile
-                // https://github.com/vitejs/vite/issues/7029
                 state.options.inlineWasm = true;
             }
         },
-
         buildStart(rollup) {
             state.reset();
-
             state.processOptions(this);
-
             state.watch = this.meta.watchMode || rollup.watch;
-
             state.release = (state.options.optimize.release == null
                 ? !state.watch
                 : state.options.optimize.release);
         },
-
-        // This is only compatible with Rollup 2.78.0 and higher
         resolveId: {
             order: "pre",
             handler(id, importer, info) {
                 if (id === INLINE_ID) {
                     return {
                         id: stripPath(importer) + "?inline",
-                        meta: {
-                            "rollup-plugin-rust": { root: true }
-                        }
+                        meta: { "rollup-plugin-rust": { root: true } }
                     };
-
                 } else {
                     const name = $path.basename(id);
-
                     const normal = (name === "Cargo.toml");
                     const custom = (name === "Cargo.toml?custom");
-
                     if ((normal || custom) && filter(id)) {
                         const path = (importer ? $path.resolve($path.dirname(importer), id) : $path.resolve(id));
-
                         return {
                             id: path,
                             moduleSideEffects: !custom,
-                            meta: {
-                                "rollup-plugin-rust": { root: true }
-                            }
+                            meta: { "rollup-plugin-rust": { root: true } }
                         };
-
-                    // Rewrites the fake file paths to real file paths.
                     } else if (importer && id[0] === ".") {
                         const info = this.getModuleInfo(importer);
-
                         if (info && info.meta) {
                             const meta = info.meta["rollup-plugin-rust"];
-
                             if (meta && !meta.root) {
-                                // TODO maybe use resolve ?
                                 const path = $path.join($path.dirname(importer), id);
-
-                                const realPath = (id.startsWith(PREFIX)
-                                    ? meta.realPath
-                                    : $path.join($path.dirname(meta.realPath), id));
-
+                                const realPath = $path.join($path.dirname(meta.realPath), id);
                                 return {
                                     id: path,
                                     meta: {
@@ -739,53 +459,40 @@ export default function rust(options = {}) {
                         }
                     }
                 }
-
                 return null;
             },
         },
-
         load(id, loadState) {
             const info = this.getModuleInfo(id);
-
             if (info && info.meta) {
                 const meta = info.meta["rollup-plugin-rust"];
-
                 if (meta) {
                     if (meta.root) {
-                        // This causes Vite to load a noop module during SSR
                         if (state.vite && loadState && loadState.ssr) {
                             return {
                                 code: `export {};`,
                                 map: { mappings: '' },
                                 moduleSideEffects: false,
                             };
-
-                        // This compiles the Cargo.toml
                         } else {
                             return state.load(this, id);
                         }
-
                     } else {
                         if (options.verbose) {
                             debug(`Loading file ${meta.realPath}`);
                         }
-
-                        // This maps the fake path to a real path on disk and loads it
                         return readString(meta.realPath);
                     }
                 }
             }
-
             return null;
         },
-
         resolveFileUrl(info) {
             if (state.fileIds.has(info.referenceId)) {
                 return `new URL(${JSON.stringify(info.fileName)}, import.meta.url)`;
-
             } else {
                 return null;
             }
         },
     };
-};
+}
