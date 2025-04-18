@@ -379,8 +379,6 @@ class State {
         if (promise == null) {
             const dir = $path.dirname(id);
 
-            console.log(cx, dir, id);
-
             promise = this.cache.build[id] = Promise.all([
                 this.build(cx, dir, id),
                 this.watchFiles(cx, dir),
